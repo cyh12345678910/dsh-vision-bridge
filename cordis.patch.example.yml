@@ -1,0 +1,50 @@
+# cordis.patch.yml — vision-bridge 宿主级插件配置示例
+#
+# 将此文件内容追加到 $DSH_HOME/cordis.patch.yml（不存在则新建）。
+# 保存即热加载，无需重启。禁用：将该行下加 `disabled: true`。
+#
+# 路径中的 {USERPROFILE} 需替换为你的实际用户目录，
+# 或使用 file:// 协议的绝对路径。
+
+# ── 后端：API（OpenAI-compatible Vision API）─────────────────────────────
+# 最简配置，仅需 API key。支持 OpenAI、Groq、Together 等。
+# 环境变量 OPENAI_API_KEY 和 OPENAI_BASE_URL 也会被读取。
+
+- insert:
+  - id: vision-bridge
+    name: "file:///C:/Users/你的用户名/.dsh/plugins/index.mjs?v=1"
+    config:
+      backend: api
+      apiKey: ""              # 或设置环境变量 OPENAI_API_KEY
+      apiBase: ""             # 或设置环境变量 OPENAI_BASE_URL（如 https://api.groq.com/openai/v1）
+      apiModel: "gpt-4o"      # 或 gpt-4o-mini, llama-3.2-90b-vision-preview 等
+      timeoutMs: 60000
+      cacheMaxEntries: 200
+
+# ── 后端：CDP（桌面豆包桥接，跨平台）─────────────────────────────────────
+# 保留 doubao-vision-dsh 的 CDP 能力，但路径自动解析、跨平台支持。
+# Windows/macOS 下豆包路径自动检测，Linux 需手动配置。
+
+# - insert:
+#   - id: vision-bridge
+#     name: "file:///C:/Users/你的用户名/.dsh/plugins/index.mjs?v=1"
+#     config:
+#       backend: cdp
+#       cdpExePath: ""           # 留空则自动检测（Windows/macOS）
+#       cdpPort: 9225
+#       cdpAppUrlPrefix: "doubao://doubao-chat/chat"
+#       timeoutMs: 60000
+#       cacheMaxEntries: 200
+
+# ── 自定义选择器（高级）────────────────────────────────────────────────────
+# 如果 CDP 后端的默认 DOM 选择器不匹配（非豆包应用），可自定义：
+
+# - insert:
+#   - id: vision-bridge
+#     name: "file:///C:/Users/你的用户名/.dsh/plugins/index.mjs?v=1"
+#     config:
+#       backend: cdp
+#       cdpTextareaSelector: '[data-testid="chat_input_input"]'
+#       cdpUploadSelector: '[data-testid="upload-file-input"]'
+#       cdpMsgSelector: '[data-testid="message_content"]'
+#       cdpClickSendScript: '(function(){var b=document.querySelector(\"[data-testid=chat_input_send_button]\");if(b){b.click();return \"clicked\";}return \"none\";})()'
