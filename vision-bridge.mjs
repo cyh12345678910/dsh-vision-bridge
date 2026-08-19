@@ -48,7 +48,7 @@ const DOUBAO_EXE_PATHS = {
 const PATCHED = Symbol.for('vision-bridge.patched')
 
 let patchRefs = 0
-let globalAdapters = null
+let globalLlm = null
 let globalOffUpdated = null
 let globalConfig = null
 
@@ -228,6 +228,7 @@ async function recognizeViaApi(filePath, question, cfg, signal) {
   const baseURL = cfg.apiBase || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1'
   const model = cfg.apiModel || 'gpt-4o'
 
+  logLine('api: reading image ' + filePath)
   const imageBuffer = readFileSync(filePath)
   const base64 = imageBuffer.toString('base64')
   const ext = basename(filePath).split('.').pop()?.toLowerCase() || 'png'
@@ -250,14 +251,24 @@ async function recognizeViaApi(filePath, question, cfg, signal) {
     max_tokens: 1024,
   }
 
+  const url = baseURL.replace(/\/$/, '') + '/chat/completions'
+  logLine('api: POST ' + url + ' model=' + model + ' size=' + imageBuffer.length + ' bytes')
+
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), cfg.timeoutMs || DEFAULT_TIMEOUT_MS)
+  const timeoutMs = cfg.timeoutMs || DEFAULT_TIMEOUT_MS
+  const timeout = setTimeout(() => {
+    logLine('api: request timed out after ' + timeoutMs + 'ms')
+    controller.abort()
+  }, timeoutMs)
   if (signal) {
-    signal.addEventListener('abort', () => controller.abort(), { once: true })
+    signal.addEventListener('abort', () => {
+      logLine('api: external abort signal received')
+      controller.abort()
+    }, { once: true })
   }
 
   try {
-    const resp = await fetch(baseURL.replace(/\/$/, '') + '/chat/completions', {
+    const resp = await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -267,14 +278,18 @@ async function recognizeViaApi(filePath, question, cfg, signal) {
       signal: controller.signal,
     })
 
+    logLine('api: response status=' + resp.status)
+
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '')
+      logError('api: error response body', errText.slice(0, 500))
       throw new Error('Vision API 返回 ' + resp.status + ': ' + errText.slice(0, 200))
     }
 
     const data = await resp.json()
     const text = data?.choices?.[0]?.message?.content
     if (!text) {
+      logError('api: empty content in response', JSON.stringify(data).slice(0, 300))
       throw new Error('Vision API 返回空内容')
     }
     return text
@@ -718,93 +733,143 @@ function archiveImage(filePath) {
   }
 }
 
-// ── Adapter patching ────────────────────────────────────────────────────────
+// ── LLM runtime patching ───────────────────────────────────────────────────
 
 function addImageModality(info) {
-  if (info && Array.isArray(info.inputModalities) && !info.inputModalities.includes('image')) {
+  if (!info) return info
+  if (Array.isArray(info.inputModalities)) {
+    if (info.inputModalities.includes('image')) return info
     return { ...info, inputModalities: [...info.inputModalities, 'image'] }
   }
-  return info
+  return { ...info, inputModalities: ['text', 'image'] }
 }
 
-function patchAdapter(adapter) {
-  if (!adapter || typeof adapter !== 'object' || adapter[PATCHED]) return
+function stripImageBlocks(options) {
+  const messages = options && options.messages
+  if (!Array.isArray(messages)) return options
+  let changed = false
+  let imageCount = 0
+  const sanitized = messages.map((m) => {
+    if (!m || !Array.isArray(m.content) || !m.content.some((b) => b && b.type === 'image')) return m
+    changed = true
+    const textBlocks = m.content.filter((b) => !(b && b.type === 'image'))
+    const imageBlocks = m.content.filter((b) => b && b.type === 'image')
 
+    const paths = []
+    for (const img of imageBlocks) {
+      imageCount++
+      const att = img.attachment
+      if (att && att.attachmentId) {
+        const hash = String(att.attachmentId).replace(/^sha256:/, '')
+        if (hash.length >= 2) {
+          const path = join(DSH_HOME, 'attachments', 'v1', 'objects', hash.slice(0, 2), hash)
+          paths.push(path)
+        }
+      }
+    }
+
+    if (paths.length > 0) {
+      textBlocks.push({
+        type: 'text',
+        text: '[用户发送了图片（' + paths.length + '张）。请使用 vision_recognize 工具识别图片内容，file_path 参数为：' + paths.join(' 或 ') + ']',
+      })
+    } else {
+      textBlocks.push({
+        type: 'text',
+        text: '[用户发送了一张图片。请使用 vision_recognize 工具识别图片内容。]',
+      })
+    }
+    return { ...m, content: textBlocks }
+  })
+  if (!changed) return options
+  logLine('stream: stripped ' + imageCount + ' image blocks, added vision_recognize hint')
+  return { ...options, messages: sanitized }
+}
+
+function patchAdapterStream(adapter) {
+  if (!adapter || typeof adapter !== 'object' || adapter[PATCHED]) return
+  if (typeof adapter.stream !== 'function') return
+  const origStream = adapter.stream
+  adapter.stream = function (options) {
+    return origStream.call(this, stripImageBlocks(options))
+  }
+  adapter[PATCHED] = { stream: origStream }
+}
+
+function patchLlmRuntime(llm) {
+  if (!llm || llm[PATCHED]) return
   const originals = {}
   let patchedAny = false
 
-  if (typeof adapter.resolveModel === 'function') {
-    originals.resolveModel = adapter.resolveModel
+  if (typeof llm.resolveModelInfo === 'function') {
+    originals.resolveModelInfo = llm.resolveModelInfo
     try {
-      adapter.resolveModel = async function (provider, model, signal) {
-        const info = await originals.resolveModel.call(this, provider, model, signal)
+      llm.resolveModelInfo = async function (...args) {
+        const info = await originals.resolveModelInfo.apply(this, args)
         return addImageModality(info)
       }
       patchedAny = true
-    } catch (e) { logError('patchAdapter.resolveModel', e) }
+    } catch (e) { logError('patchLlmRuntime.resolveModelInfo', e) }
   }
 
-  if (typeof adapter.listModels === 'function') {
-    originals.listModels = adapter.listModels
+  if (typeof llm.listModels === 'function') {
+    originals.listModels = llm.listModels
     try {
-      adapter.listModels = async function (provider) {
-        const models = await originals.listModels.call(this, provider)
+      llm.listModels = async function (...args) {
+        const models = await originals.listModels.apply(this, args)
         if (!Array.isArray(models)) return models
         return models.map((m) => addImageModality(m))
       }
       patchedAny = true
-    } catch (e) { logError('patchAdapter.listModels', e) }
+    } catch (e) { logError('patchLlmRuntime.listModels', e) }
   }
 
-  // Strip image blocks from outgoing model requests: the transcript and chat UI
-  // keep the picture, but the text-only provider route must never receive it.
-  if (typeof adapter.stream === 'function') {
-    originals.stream = adapter.stream
+  if (typeof llm.stream === 'function') {
+    originals.stream = llm.stream
     try {
-      adapter.stream = function (options) {
-        const messages = options && options.messages
-        if (!Array.isArray(messages)) return originals.stream.call(this, options)
-
-        let changed = false
-        const sanitized = messages.map((m) => {
-          if (!m || !Array.isArray(m.content) || !m.content.some((b) => b && b.type === 'image')) return m
-          changed = true
-          return { ...m, content: m.content.filter((b) => !(b && b.type === 'image')) }
-        })
-
-        if (!changed) return originals.stream.call(this, options)
-        logLine('adapter stream: stripped image blocks from request messages')
-        return originals.stream.call(this, { ...options, messages: sanitized })
+      llm.stream = function (options) {
+        return originals.stream.call(this, stripImageBlocks(options))
       }
       patchedAny = true
-    } catch (e) { logError('patchAdapter.stream', e) }
+    } catch (e) { logError('patchLlmRuntime.stream', e) }
+  }
+
+  if (typeof llm.registerAdapter === 'function') {
+    originals.registerAdapter = llm.registerAdapter
+    try {
+      llm.registerAdapter = function (providers, adapter) {
+        patchAdapterStream(adapter)
+        return originals.registerAdapter.call(this, providers, adapter)
+      }
+      patchedAny = true
+    } catch (e) { logError('patchLlmRuntime.registerAdapter', e) }
   }
 
   if (patchedAny) {
-    adapter[PATCHED] = originals
+    llm[PATCHED] = originals
+    logLine('patched llm runtime: resolveModelInfo + listModels'
+      + (originals.stream ? ' + stream' : '')
+      + (originals.registerAdapter ? ' + registerAdapter' : ''))
   }
 }
 
-function restoreAllAdapters() {
+function restoreLlmRuntime() {
   try {
-    if (globalAdapters && typeof globalAdapters.forEach === 'function') {
-      globalAdapters.forEach((reg) => {
-        const adapter = reg && reg.adapter
-        const originals = adapter && adapter[PATCHED]
-        if (!originals) return
-        for (const name of Object.keys(originals)) {
-          try { adapter[name] = originals[name] } catch (e) { logError('restoreAllAdapters.' + name, e) }
-        }
-        try { delete adapter[PATCHED] } catch { /* */ }
-      })
+    if (!globalLlm) return
+    const originals = globalLlm[PATCHED]
+    if (!originals) return
+    for (const name of Object.keys(originals)) {
+      try { globalLlm[name] = originals[name] } catch (e) { logError('restoreLlmRuntime.' + name, e) }
     }
-  } catch (e) { logError('restoreAllAdapters', e) }
+    try { delete globalLlm[PATCHED] } catch { /* */ }
+  } catch (e) { logError('restoreLlmRuntime', e) }
 }
 
 // ── Plugin lifecycle ────────────────────────────────────────────────────────
 
 const plugin = {
   name: 'vision-bridge',
+  inject: ['tools'],
 
   apply(ctx, config) {
     globalConfig = {
@@ -832,39 +897,48 @@ const plugin = {
       mkdirSync(CACHE_DIR, { recursive: true })
     } catch { /* dirs may exist */ }
 
-    // Patch adapters to advertise image input modality and strip image blocks
+    // Patch LLM runtime to advertise image input modality and strip image blocks
     try {
-      const adapters = ctx.get('adapters')
-      if (adapters && typeof adapters.forEach === 'function') {
-        globalAdapters = adapters
-        adapters.forEach((reg) => patchAdapter(reg && reg.adapter))
+      const llm = ctx.get('llm')
+      if (llm) {
+        globalLlm = llm
+        patchLlmRuntime(llm)
+      } else {
+        logLine('WARNING: llm service not available at apply time')
       }
     } catch (e) {
-      logError('apply: could not access adapters service', e)
+      logError('apply: could not access llm service', e)
     }
 
     // Register tools
     try {
-      ctx.tool('vision_recognize', {
-        description: '识别本地图片文件。传入文件路径和可选的问题，返回图片描述或文字识别结果。',
+      ctx.tools.register({
+        name: 'vision_recognize',
+        description: '识别本地图片文件。当用户发送图片时必须调用此工具，不要用bash/ls/find查找文件。传入文件路径和可选的问题，返回图片描述或文字识别结果。工具运行在主机上，可以直接访问任何文件路径。',
         parameters: {
           type: 'object',
           properties: {
             file_path: { type: 'string', description: '本地图片文件路径（PNG/JPEG/GIF/WebP）' },
             question: {
               type: 'string',
-              description: '想让视觉后端回答的问题（默认：详细描述图片内容',
+              description: '想让视觉后端回答的问题（默认：详细描述图片内容）',
               default: DEFAULT_QUESTION,
             },
           },
           required: ['file_path'],
         },
-        async execute({ file_path, question }) {
-          const q = question || DEFAULT_QUESTION
-          logLine('tool vision_recognize: ' + file_path + ' q=' + q.slice(0, 50))
-          archiveImage(file_path)
-          const text = await recognizeImage(file_path, q, globalConfig, this.signal)
-          return { content: [{ type: 'text', text }] }
+        output: {
+          schema: { type: 'string' },
+          render(_args, value) {
+            return [{ type: 'text', text: String(value) }]
+          },
+        },
+        async execute(args, exec) {
+          const q = args.question || DEFAULT_QUESTION
+          logLine('tool vision_recognize: ' + args.file_path + ' q=' + q.slice(0, 50))
+          archiveImage(args.file_path)
+          const text = await recognizeImage(args.file_path, q, globalConfig, exec.signal)
+          return text
         },
       })
     } catch (e) {
@@ -878,11 +952,15 @@ const plugin = {
           name: 'vision-bridge',
           order: -90,
           text: () =>
-            '## Vision\n\n'
-            + 'You can recognize images via the `vision_recognize` tool. '
-            + 'Pass a local file path and an optional question. '
-            + 'The tool returns text describing the image content. '
-            + 'Use this when the user asks about an image you cannot directly see.',
+            '## Vision Tool (MANDATORY)\n\n'
+            + 'When the user sends an image, you MUST immediately call the `vision_recognize` tool with the file path provided in the message. '
+            + 'The tool runs on the host and can access any file path directly, including Windows paths like C:\\Users\\... and Linux paths.\n\n'
+            + 'DO NOT use bash, ls, find, or any other tool to locate or read image files. '
+            + 'The file path in the message is already correct and accessible by the vision_recognize tool.\n\n'
+            + 'Example workflow:\n'
+            + '- Message contains: "[用户发送了图片。请使用 vision_recognize 工具识别图片内容，file_path 参数为：C:\\\\Users\\\\...]"\n'
+            + '- Your action: Call vision_recognize with file_path="C:\\\\Users\\\\..."\n'
+            + '- The tool returns a text description of the image content\n',
         })
       })
     } catch (e) {
@@ -894,7 +972,7 @@ const plugin = {
     return () => {
       patchRefs--
       if (patchRefs <= 0) {
-        restoreAllAdapters()
+        restoreLlmRuntime()
         logLine('dispose: vision-bridge unloaded')
       }
     }
