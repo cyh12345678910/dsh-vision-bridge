@@ -1,0 +1,37 @@
+{
+  "name": "dsh-vision-bridge",
+  "version": "1.0.0",
+  "description": "Give text-only DeepSeek Harness agents vision — multi-backend (OpenAI Vision API + CDP bridge), cross-platform, cached, configurable.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs",
+    "./vision-bridge.mjs": "./vision-bridge.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "vision",
+    "multimodal",
+    "ocr",
+    "image-recognition",
+    "openai-vision",
+    "cdp",
+    "cordis"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "files": [
+    "index.mjs",
+    "vision-bridge.mjs",
+    "README.md",
+    "LICENSE",
+    "cordis.patch.example.yml"
+  ]
+}
